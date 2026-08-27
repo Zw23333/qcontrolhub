@@ -1166,6 +1166,9 @@ func (e *Executor) importExistingConfig(ctx context.Context, engine core.Engine,
 	if err := verifyCoreMigrationStagedFiles(managed, migrationRecord); err != nil {
 		return rollbackMigration(err)
 	}
+	if err := preflightManagedServiceConfiguration(ctx, engine, managed, manager); err != nil {
+		return rollbackMigration(err)
+	}
 	currentExistingEnableState, err := serviceEnableState(ctx, existing.Service, manager)
 	if err != nil {
 		return rollbackMigration(err)
@@ -1240,6 +1243,41 @@ func (e *Executor) importExistingConfig(ctx context.Context, engine core.Engine,
 	delete(e.ExistingSpecs, engine)
 	e.specsMu.Unlock()
 	return fmt.Sprintf("imported %s configuration; stopped and disabled %s; started and enabled %s", engine, existing.Service, managed.Service), nil
+}
+
+func preflightManagedServiceConfiguration(ctx context.Context, engine core.Engine, spec EngineSpec, managers ...*ServiceManager) error {
+	manager := selectedServiceManager(managers...)
+	defaultSpec, ok := DefaultSpecsForServiceManager(manager.Kind())[engine]
+	if !ok || spec != defaultSpec {
+		return nil
+	}
+	return validateManagedServiceConfigurationForServiceUser(ctx, engine, spec, manager)
+}
+
+func validateManagedServiceConfigurationForServiceUser(ctx context.Context, engine core.Engine, spec EngineSpec, manager *ServiceManager) error {
+	var arguments []string
+	switch engine {
+	case core.EngineMihomo:
+		arguments = []string{"-t", "-f", spec.ConfigPath}
+	case core.EngineXray:
+		arguments = []string{"run", "-test", "-config", spec.ConfigPath}
+	case core.EngineSingBox:
+		arguments = []string{"check", "-c", spec.ConfigPath}
+	default:
+		return nil
+	}
+	output, err := runManagedCorePreflight(ctx, manager, spec, arguments...)
+	if err == nil {
+		return nil
+	}
+	detail := strings.TrimSpace(output)
+	if detail == "" {
+		detail = err.Error()
+	}
+	return fmt.Errorf(
+		"managed %s service user %s cannot load the imported configuration before service cutover: %s; grant that user read access to every referenced file and traverse access to its parent directories",
+		engine, managedCoreServiceGroup, detail,
+	)
 }
 
 func (e *Executor) validateImportedSnapshot(ctx context.Context, engine core.Engine, spec EngineSpec, content string) (string, error) {
